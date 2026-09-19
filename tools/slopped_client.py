@@ -127,13 +127,24 @@ def turn_kwargs(cfg):
         return {"error": "%s: %s" % (type(e).__name__, e)}
 
 
+def turn_field(turn, *names):
+    """The live gateway lowercases the turn block (uri/username/password);
+    peerctl's reflect tables say URI/Username/Password.  Accept either."""
+    low = {str(k).lower(): v for k, v in turn.items()}
+    for n in names:
+        v = low.get(n.lower())
+        if v not in (None, ""):
+            return v
+    return None
+
+
 def ice_servers(cfg):
     turn = cfg.get("turn") or {}
-    uri = normalize_turn_uri(turn.get("URI") or turn.get("uri") or "")
+    uri = normalize_turn_uri(turn_field(turn, "uri") or "")
     if not uri:
         return []
-    return [RTCIceServer(urls=[uri], username=turn.get("Username"),
-                         credential=turn.get("Password"))]
+    return [RTCIceServer(urls=[uri], username=turn_field(turn, "username"),
+                         credential=turn_field(turn, "password"))]
 
 
 def patch_turn_tls(insecure):
@@ -177,11 +188,38 @@ def cand_from_json(blob):
         kw["relatedPort"] = int(fields[fields.index("rport") + 1])
     if c.get("usernameFragment"):
         kw["usernameFragment"] = c["usernameFragment"]
+    # The gateway's ice_candidate blobs carry neither sdpMid nor
+    # sdpMLineIndex, and aiortc refuses the candidate without one of them.
+    # Its SDP only ever has a=mid:0, so default to that.
+    if c.get("sdpMid") is not None:
+        kw["sdpMid"] = str(c["sdpMid"])
+    elif c.get("sdpMLineIndex") is not None:
+        kw["sdpMLineIndex"] = int(c["sdpMLineIndex"])
+    else:
+        kw["sdpMid"] = "0"
+    # aiortc's field set differs between releases (usernameFragment is newer),
+    # so keep only the kwargs this version actually accepts.
+    try:
+        import dataclasses
+        ok = {f.name for f in dataclasses.fields(RTCIceCandidate)}
+        kw = {k: v for k, v in kw.items() if k in ok}
+    except Exception:                                       # noqa: BLE001
+        pass
     return RTCIceCandidate(**kw)
 
 
+def pick_channel(cfg, want=None):
+    chans = cfg.get("channels") or []
+    if want:
+        return want
+    for c in chans:
+        if "chat" in c:
+            return c
+    return chans[0] if chans else CHANNEL_LABEL
+
+
 class Client:
-    def __init__(self, cfg, insecure=False, verbose=False):
+    def __init__(self, cfg, insecure=False, verbose=False, channel=None):
         self.cfg = cfg
         self.verbose = verbose
         self.ssl_ctx = ssl._create_unverified_context() if insecure else None
@@ -191,7 +229,11 @@ class Client:
             print("[turn] %s" % json.dumps(turn_kwargs(cfg), default=str),
                   file=sys.stderr)
         self.pc = RTCPeerConnection(RTCConfiguration(iceServers=ice_servers(cfg)))
-        self.ch = self.pc.createDataChannel(CHANNEL_LABEL, ordered=True)
+        self.label = pick_channel(cfg, channel)
+        if verbose:
+            print("[chan] %s (config offers %s)"
+                  % (self.label, cfg.get("channels")), file=sys.stderr)
+        self.ch = self.pc.createDataChannel(self.label, ordered=True)
         self.inbox = asyncio.Queue()
         self.ws = None
         self.pumper = None
@@ -340,6 +382,47 @@ async def cmd_history(cli, args):
                "fields": json.loads(args.fields)}
     f = await cli.request(TYPE_HISTORY, payload, timeout=args.timeout)
     print(json.dumps(f, default=str))
+
+
+async def cmd_dump(cli, args):
+    """Page the whole archive.  The live gateway publishes max_history_batch=32,
+    so one HISTORY_PULL only ever returns 32 rows; walk the cursor instead."""
+    cap = int(cli.cfg.get("max_history_batch") or 32)
+    limit = max(1, min(args.limit, cap))
+    fields = json.loads(args.fields)
+    after = args.after
+    total = 0
+    for page in range(args.pages):
+        f = await cli.request(TYPE_HISTORY,
+                              {"limit": limit, "after": after, "fields": fields},
+                              timeout=args.timeout)
+        p = f.get("payload")
+        if not isinstance(p, dict):
+            print("page %d: unexpected payload %s" % (page, json.dumps(f, default=str)))
+            break
+        rows = p.get("rows") or p.get("items") or p.get("history") or []
+        if not isinstance(rows, list):
+            print("page %d: rows is not a list: %r" % (page, rows))
+            break
+        for r in rows:
+            total += 1
+            print(json.dumps(r, default=str))
+        print("[*] page %d: %d rows (after=%s)" % (page, len(rows), after),
+              file=sys.stderr)
+        if not rows or len(rows) < limit:
+            break
+        # advance the cursor from whichever key the rows actually carry
+        last = rows[-1]
+        nxt = None
+        for k in ("id", "seq", "sent_at", "ts", "timestamp"):
+            if isinstance(last, dict) and last.get(k) is not None:
+                nxt = last[k]
+                break
+        if nxt is None or nxt == after:
+            print("[*] no cursor key in %r; stopping" % (last,), file=sys.stderr)
+            break
+        after = nxt
+    print("[*] dumped %d rows total" % total, file=sys.stderr)
 
 
 async def cmd_raw(cli, args):
@@ -519,6 +602,8 @@ def main():
     ap.add_argument("--insecure", action="store_true", help="skip TLS verification")
     ap.add_argument("--verbose", "-v", action="store_true")
     ap.add_argument("--timeout", type=float, default=20.0)
+    ap.add_argument("--channel", default=None,
+                   help="datachannel label (default: the config's chat channel)")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     p = sub.add_parser("chat"); p.add_argument("text")
@@ -539,6 +624,11 @@ def main():
     p.add_argument("--pad-to", type=int, default=None,
                    help="pad the frame to N bytes (oversize probe)")
     p.add_argument("--no-wait", action="store_true")
+    p = sub.add_parser("dump")
+    p.add_argument("--limit", type=int, default=32)
+    p.add_argument("--after", type=int, default=0)
+    p.add_argument("--pages", type=int, default=200)
+    p.add_argument("--fields", default='["sender","body","sent_at"]')
     sub.add_parser("recon")
     sub.add_parser("probe")
     args = ap.parse_args()
@@ -553,11 +643,13 @@ def main():
               file=sys.stderr)
 
     async def run():
-        cli = Client(cfg, insecure=args.insecure, verbose=args.verbose)
+        cli = Client(cfg, insecure=args.insecure, verbose=args.verbose,
+                     channel=args.channel)
         try:
             await cli.connect(timeout=args.timeout)
             print("[*] datachannel open", file=sys.stderr)
             await {"chat": cmd_chat, "history": cmd_history, "raw": cmd_raw,
+                   "dump": cmd_dump,
                    "recon": cmd_recon, "probe": cmd_probe}[args.cmd](cli, args)
         finally:
             await cli.close()

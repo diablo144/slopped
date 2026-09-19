@@ -111,7 +111,7 @@ class ArchivePeer:
         self.history = [
             {"sender": "archivist", "body": "history entry %d" % i,
              "sent_at": 1_700_000_000 + i}
-            for i in range(5)
+            for i in range(25)
         ]
 
     def reply(self, req):
