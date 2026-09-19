@@ -156,7 +156,12 @@ class Client:
         peer tears the session down as soon as the signalling socket closes."""
         ws_url = self.cfg["websocket"]
         ws_url += ("&" if "?" in ws_url else "?") + ROLE_QUERY.lstrip("?")
-        self.ws = await ws_connect(ws_url, ssl=self.ssl_ctx, open_timeout=timeout)
+        # websockets rejects ssl=None for a wss:// URI, so hand it a verifying
+        # context unless --insecure already supplied an unverified one.
+        ws_ssl = self.ssl_ctx
+        if ws_ssl is None and ws_url.lower().startswith("wss://"):
+            ws_ssl = ssl.create_default_context()
+        self.ws = await ws_connect(ws_url, ssl=ws_ssl, open_timeout=timeout)
 
         await self.pc.setLocalDescription(await self.pc.createOffer())
         sent = set()

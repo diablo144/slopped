@@ -89,7 +89,8 @@ class ConfigHandler:
             log("HTTP", req.decode(errors="replace").strip())
             cfg = {
                 "protocol_version": 1,
-                "websocket": "ws://127.0.0.1:%d/v1/signal" % WS_PORT,
+                "websocket": "%s://127.0.0.1:%d/v1/signal"
+                % ("wss" if os.environ.get("MOCK_TLS") else "ws", WS_PORT),
                 "turn": {"URI": TURN_URI, "Username": "mock", "Password": "mock"},
                 "peer_fingerprint": self.fingerprint,
                 "channels": ["gmp.chat.v1?role=guest"],
@@ -206,7 +207,12 @@ async def main():
     peer = ArchivePeer()
     await asyncio.start_server(ConfigHandler(fingerprint).handle, "0.0.0.0", HTTP_PORT)
     log("HTTP /v1/config on %d" % HTTP_PORT)
-    async with serve(lambda ws: ws_handler(ws, peer), "0.0.0.0", WS_PORT):
+    ws_ssl = None
+    if os.environ.get("MOCK_TLS"):
+        import ssl as _ssl
+        ws_ssl = _ssl.SSLContext(_ssl.PROTOCOL_TLS_SERVER)
+        ws_ssl.load_cert_chain("/tmp/mock/cert.pem", "/tmp/mock/key.pem")
+    async with serve(lambda ws: ws_handler(ws, peer), "0.0.0.0", WS_PORT, ssl=ws_ssl):
         log("WS on %d" % WS_PORT)
         await asyncio.Future()
 
