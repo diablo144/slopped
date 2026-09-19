@@ -26,7 +26,7 @@ from websockets.asyncio.server import serve
 WS_PORT = 8090
 HTTP_PORT = 8080
 LOGFILE = "/tmp/mock/mockpeer.log"
-TURN_URI = "turn:127.0.0.1:9?transport=udp"
+TURN_URI = os.environ.get("MOCK_TURN_URI", "turn:127.0.0.1:9?transport=udp")
 
 _logfh = open(LOGFILE, "a", buffering=1)
 

@@ -37,6 +37,7 @@ Requires:  pip install aiortc websockets cbor2
 import argparse
 import asyncio
 import json
+import re
 import ssl
 import struct
 import sys
@@ -96,13 +97,65 @@ def fetch_config(url, insecure=False):
         return json.loads(r.read().decode())
 
 
+_TURN_SCHEME = re.compile(r"^(stuns?|turns?)://", re.I)
+
+
+def normalize_turn_uri(uri):
+    """`turns://host:1337?transport=tcp` -> `turns:host:1337?transport=tcp`.
+
+    aiortc's TURN_REGEX does not treat `//` as an authority separator, so a
+    double-slash URI parses to host="//host" and aioice then tries to resolve
+    a hostname with two slashes in it.  DNS fails, the relay candidate is
+    dropped without raising, and -- with the peer reachable only via the
+    relay -- the datachannel simply never opens.  Strip the `//`.
+    """
+    if not uri:
+        return uri
+    uri = _TURN_SCHEME.sub(lambda m: m.group(1).lower() + ":", uri.strip())
+    # aiortc accepts a turns: server only when transport=tcp; assume it.
+    if uri.lower().startswith("turns:") and "transport=" not in uri:
+        uri += "?transport=tcp"
+    return uri
+
+
+def turn_kwargs(cfg):
+    """What aiortc will actually dial, for the record."""
+    try:
+        from aiortc.rtcicetransport import connection_kwargs
+        return connection_kwargs(ice_servers(cfg))
+    except Exception as e:                              # pragma: no cover
+        return {"error": "%s: %s" % (type(e).__name__, e)}
+
+
 def ice_servers(cfg):
     turn = cfg.get("turn") or {}
-    uri = turn.get("URI") or turn.get("uri") or ""
+    uri = normalize_turn_uri(turn.get("URI") or turn.get("uri") or "")
     if not uri:
         return []
     return [RTCIceServer(urls=[uri], username=turn.get("Username"),
                          credential=turn.get("Password"))]
+
+
+def patch_turn_tls(insecure):
+    """aiortc passes `ssl=True` for a turns: server, which builds a *verifying*
+    context; --insecure has no way to reach a relay with a self-signed cert.
+    Substitute an unverified context for the TURN TLS handshake only."""
+    if not insecure:
+        return False
+    try:
+        from aioice import turn as aturn
+        ctx = ssl._create_unverified_context()
+        orig = aturn.create_turn_endpoint
+
+        async def patched(*a, **kw):
+            if kw.get("ssl"):
+                kw["ssl"] = ctx
+            return await orig(*a, **kw)
+
+        aturn.create_turn_endpoint = patched
+        return True
+    except Exception:
+        return False
 
 
 def cand_to_json(sdp_line, ufrag):
@@ -132,6 +185,11 @@ class Client:
         self.cfg = cfg
         self.verbose = verbose
         self.ssl_ctx = ssl._create_unverified_context() if insecure else None
+        self.cands = []
+        self.answers = 0
+        if verbose:
+            print("[turn] %s" % json.dumps(turn_kwargs(cfg), default=str),
+                  file=sys.stderr)
         self.pc = RTCPeerConnection(RTCConfiguration(iceServers=ice_servers(cfg)))
         self.ch = self.pc.createDataChannel(CHANNEL_LABEL, ordered=True)
         self.inbox = asyncio.Queue()
@@ -175,6 +233,10 @@ class Client:
                         ufrag = line.split(":", 1)[1]
                     if line.startswith("a=candidate:") and line not in sent:
                         sent.add(line)
+                        self.cands.append(line[len("a=candidate:"):])
+                        if self.verbose:
+                            print("[cand] %s" % line[len("a=candidate:"):],
+                                  file=sys.stderr)
                         await self.ws.send(json.dumps(
                             {"type": "ice_candidate",
                              "candidate": cand_to_json(line[len("a="):], ufrag)}))
@@ -187,7 +249,27 @@ class Client:
                                        "sdp": self.pc.localDescription.sdp}))
 
         self.pumper = asyncio.ensure_future(self._pump())
-        await asyncio.wait_for(self._open.wait(), timeout)
+        try:
+            await asyncio.wait_for(self._open.wait(), timeout)
+        except (asyncio.TimeoutError, TimeoutError):
+            relay = [c for c in self.cands if " typ relay" in c]
+            print("[!] datachannel never opened after %ss\n"
+                  "    iceGatheringState=%s iceConnectionState=%s "
+                  "connectionState=%s\n"
+                  "    %d local candidate(s), %d relay candidate(s)\n"
+                  "    sdp_answer frames received: %d\n"
+                  "    turn: %s"
+                  % (timeout, self.pc.iceGatheringState,
+                     self.pc.iceConnectionState, self.pc.connectionState,
+                     len(self.cands), len(relay), self.answers,
+                     json.dumps(turn_kwargs(self.cfg), default=str)),
+                  file=sys.stderr)
+            if not relay:
+                print("    -> no relay candidate: the TURN allocation failed. "
+                      "A peer reachable only via the relay will never answer.\n"
+                      "       Re-run with --verbose to see the local candidates.",
+                      file=sys.stderr)
+            raise
 
     async def _pump(self):
         try:
@@ -195,6 +277,7 @@ class Client:
                 obj = json.loads(msg)
                 t = obj.get("type")
                 if t == "sdp_answer":
+                    self.answers += 1
                     await self.pc.setRemoteDescription(
                         RTCSessionDescription(sdp=obj["sdp"], type="answer"))
                 elif t == "ice_candidate":
@@ -463,6 +546,11 @@ def main():
     cfg = fetch_config(args.config, insecure=args.insecure)
     if args.verbose:
         print("[config] %s" % json.dumps(cfg), file=sys.stderr)
+        print("[turn ] %s" % json.dumps(turn_kwargs(cfg), default=str),
+              file=sys.stderr)
+    if patch_turn_tls(args.insecure) and args.verbose:
+        print("[turn ] TURN TLS verification disabled (--insecure)",
+              file=sys.stderr)
 
     async def run():
         cli = Client(cfg, insecure=args.insecure, verbose=args.verbose)

@@ -148,6 +148,17 @@ load-bearing for the client.  Whether `peer_fingerprint` is actually pinned:
 | `tools/rev/disasm.py`, `tools/rev/fn.py`, `tools/rev/reflect.py` | the analysis helpers: annotated objdump of an address range, function lookup by name, and a Go reflect-table walker that dumps struct fields and tags. |
 | `tools/rev/funcs.txt` | all 10,595 functions from the pclntab, with entry addresses. |
 
+* Peer reachable only via the relay, so the TURN URI must parse.  aiortc's
+  `TURN_REGEX` has no authority separator: `turns://host:1337?transport=tcp`
+  parses to `host="//host"`, `connection_kwargs` returns
+  `turn_server=('//host', 1337)` **without raising**, aioice's DNS lookup
+  fails, the relay candidate is dropped, and the datachannel never opens --
+  a bare `TimeoutError` with no other symptom.  `normalize_turn_uri()` strips
+  the `//` before handing the URI to aiortc.
+* `--insecure` also has to cover TURN: aiortc passes `ssl=True` for a `turns:`
+  server, which builds a *verifying* context.  `patch_turn_tls()` swaps in an
+  unverified one by wrapping `aioice.turn.create_turn_endpoint`.
+
 Requires `pip install aiortc websockets cbor2` (aioice inside aiortc handles
 `turns://` over TLS, so it can reach the challenge relay).
 
