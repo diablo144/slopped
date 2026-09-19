@@ -118,18 +118,44 @@ class ArchivePeer:
         self.history.insert(19, {"sender": "archivist",
                                  "body": "zdk{LOCAL_MOCK_TEST_ONLY}",
                                  "sent_at": 1_700_000_019})
+        # the live archive is partitioned by conversation; the flag belongs to
+        # one that is NOT the default, which is why a single dump can miss it.
+        self.convs = {
+            "welcome": self.history,
+            "ops": [{"sender": "ops", "body": "ops entry %d" % i,
+                     "sent_at": 1_600_000_000 + i} for i in range(7)],
+        }
+        self.convs["ops"].insert(4, {"sender": "ops",
+                                      "body": "zdk{LOCAL_MOCK_TEST_ONLY}",
+                                      "sent_at": 1_600_000_004})
 
     def reply(self, req):
         t = req["type"]
         p = req["payload"] or {}
         if t == TYPE_CHAT:
-            text = str(p.get("text") or p.get("body") or "")
+            if "body" not in p:
+                return 0x7F, {"error": "invalid chat message"}
+            text = str(p.get("body") or "")
             return TYPE_CHAT, {"status": "ok", "message": "you said: %s" % text[:200]}
         if t == TYPE_HISTORY:
+            # the live peer keys the cursor `after_sequence` and requires a
+            # conversation_id; a missing cursor is `invalid numeric input`
+            if "after_sequence" not in p:
+                return 0x7F, {"error": "invalid numeric input"}
+            conv = p.get("conversation_id")
+            if not isinstance(conv, str) or not conv:
+                return 0x7F, {"error": "invalid conversation"}
+            if conv not in self.convs:
+                return 0x7F, {"error": "unknown conversation"}
             limit = int(p.get("limit", 10))
-            after = int(p.get("after", 0))
+            after = int(p.get("after_sequence", 0))
             fields = p.get("fields") or ["sender", "body", "sent_at"]
-            rows = [r for r in self.history if r["sent_at"] > after][:limit]
+            # the cursor is the per-row `sequence`, not the timestamp: rows are
+            # numbered once at insert time so a client that walks
+            # after_sequence advances exactly like it must against the real peer
+            allrows = [dict(r, sequence=1000 + i)
+                       for i, r in enumerate(self.convs[conv])]
+            rows = [r for r in allrows if r["sequence"] > after][:limit]
             rows = [{k: r.get(k) for k in fields if k in r} for r in rows]
             return TYPE_HISTORY, {"status": "ok", "rows": rows, "number": len(rows)}
         return 0xFF, {"status": "error", "message": "unknown request type %d" % t}
