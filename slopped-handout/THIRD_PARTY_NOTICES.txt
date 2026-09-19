@@ -1,0 +1,4 @@
+peerctl includes open-source Go modules distributed under permissive licenses.
+The principal projects are Pion WebRTC (MIT), Gorilla WebSocket (BSD-2-Clause),
+fxamacker/cbor (MIT), and Go x/crypto, x/net, and x/sys (BSD-3-Clause).
+Module versions are recorded in the organizer source's go.mod and go.sum files.
