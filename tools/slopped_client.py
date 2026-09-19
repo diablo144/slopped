@@ -456,9 +456,46 @@ async def cmd_history(cli, args):
     print(json.dumps(f, default=str))
 
 
+async def _sweep_convs(cli, args, names):
+    """Return the conversation_ids that answer with rows."""
+    live = []
+    for n in names:
+        try:
+            f = await cli.request(TYPE_HISTORY,
+                                  {"limit": 1, "fields": ["sender"],
+                                   "after_sequence": 0, "conversation_id": n},
+                                  timeout=args.timeout)
+        except Exception:                              # noqa: BLE001
+            continue
+        p = f.get("payload")
+        if isinstance(p, dict) and p.get("rows") is not None:
+            print("[conv] %-16s LIVE" % n, file=sys.stderr)
+            live.append(n)
+        else:
+            print("[conv] %-16s %s"
+                  % (n, json.dumps(p, default=str)[:70]), file=sys.stderr)
+    return live
+
+
 async def cmd_dump(cli, args):
     """Page the whole archive.  The live gateway publishes max_history_batch=32,
     so one HISTORY_PULL only ever returns 32 rows; walk the cursor instead."""
+    if args.conversation.strip().lower() == "auto":
+        names = [n.strip() for n in args.list.split(",") if n.strip()]
+        live = await _sweep_convs(cli, args, names) or ["welcome"]
+        for conv in live:
+            print("\n==== conversation %r ====" % conv, file=sys.stderr)
+            a = argparse.Namespace(**vars(args))
+            a.conversation = conv
+            if args.out:
+                # one file per conversation, so a hit is attributable
+                a.out = "%s.%s.jsonl" % (args.out, conv)
+            await _dump_one(cli, a)
+        return
+    await _dump_one(cli, args)
+
+
+async def _dump_one(cli, args):
     cap = int(cli.cfg.get("max_history_batch") or 32)
     limit = max(1, min(args.limit, cap))
     # --fields none omits the key entirely, which is how you learn the server's
@@ -792,7 +829,16 @@ def main():
                    help="pad the frame to N bytes (oversize probe)")
     p.add_argument("--no-wait", action="store_true")
     p = sub.add_parser("dump")
-    p.add_argument("--conversation", default="welcome")
+    p.add_argument("--conversation", default="welcome",
+                   help='id, or "auto" to sweep --list and dump every hit')
+    p.add_argument("--list", default=",".join([
+        "welcome", "general", "random", "off-topic", "archive", "main",
+        "staff", "mod", "moderation", "admin", "operators", "ops", "private",
+        "internal", "secret", "hidden", "flag", "flags", "ctf", "notes",
+        "dm", "direct", "support", "help", "announce", "announcements",
+        "logs", "log", "history", "backup", "deleted", "trash", "system",
+        "bot", "debug", "dev", "infra", "slopped", "archivist"]),
+        help="comma separated candidate ids for --conversation auto")
     p.add_argument("--limit", type=int, default=32)
     p.add_argument("--after", type=int, default=0)
     p.add_argument("--pages", type=int, default=200)
