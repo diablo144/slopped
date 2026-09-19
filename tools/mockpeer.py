@@ -113,6 +113,11 @@ class ArchivePeer:
              "sent_at": 1_700_000_000 + i}
             for i in range(25)
         ]
+        # planted row so the client's [FLAG] highlight and paging are testable;
+        # this value is invented, it is not a real flag.
+        self.history.insert(19, {"sender": "archivist",
+                                 "body": "zdk{LOCAL_MOCK_TEST_ONLY}",
+                                 "sent_at": 1_700_000_019})
 
     def reply(self, req):
         t = req["type"]

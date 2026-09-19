@@ -102,28 +102,36 @@ target right there.
 `-fields` (string, default `["sender","body","sent_at"]`), errors
 `unexpected history argument` and `fields must be a JSON string array: %w`.
 
-## 4. Gateway config (`rtcbridge.PublicConfig`) — verified
+## 4. The signaling gateway (captured live)
 
-`GET <signaling>/v1/config` returns:
+`GET /v1/config` from the live instance returns:
 
 ```json
-{
-  "protocol_version": 1,
-  "websocket": "wss://…/v1/signal",
-  "turn": {"URI": "turns://…:1337?transport=tcp", "Username": "…", "Password": "…"},
-  "peer_fingerprint": "sha256:…",
-  "channels": ["…"]
-}
+{"channels": ["gmp.control.v1", "gmp.chat.v1"], "max_frame": 32768,
+ "max_history_batch": 32,
+ "peer_fingerprint": "sha256:0614...4116", "protocol_version": 1,
+ "turn": {"password": "...", "username": "<expiry>:<hex>",
+          "uri": "turns:slopped-turn-<id>.challenges.z0d1ak.org:1337?transport=tcp"},
+ "websocket": "wss://slopped-<id>.challenges.z0d1ak.org/v1/ws"}
 ```
 
-Field names and types were read out of the reflect tables (`Turn` is
-`{URI, Username, Password string}` with **no** json tags, so they are
-capitalised on the wire).  Confirmed empirically: feeding peerctl
-`"turn":{"URI":""}` yields `InvalidAccessError: unknown scheme type` (pion
-parsing the empty URI), and a well-formed config connects.  `channels` is
-accepted empty and the datachannel label is hard-coded, so `channels` is not
-load-bearing for the client.  Whether `peer_fingerprint` is actually pinned:
-**unchecked**.
+Four things this told us, each of which broke an earlier revision of the
+client:
+
+* the `turn` keys are **lowercase** -- `Username`/`Password` (the peerctl
+  reflect-table spelling) yields `None` and therefore an unauthenticated
+  ALLOCATE and no relay candidate;
+* the scheme is `turns:host:1337` with a **single** slash, and aioice's
+  parser folds `//` into the hostname, so any code that assumes the usual
+  `turns://` form mis-dials;
+* `username` is prefixed with a unix timestamp (`1789809602:...`), so the
+  config must be fetched fresh -- a cached one goes stale and the relay
+  starts answering 401;
+* there are **two** datachannels.  `gmp.control.v1` has never been opened
+  successfully; `--channel` exists to try it.
+
+`max_history_batch: 32` means one HISTORY_PULL can never return the whole
+archive, which is why `dump` walks the cursor.
 
 ## 5. Signalling and transport — verified
 
@@ -221,3 +229,50 @@ writeup and no leaked organiser source.  The flag is generated per instance on
 the archive peer, which is not in the handout, and the instance is gone.  It is
 therefore not recoverable from anything on disk here — the only route is a live
 instance driven by `tools/slopped_client.py`.
+
+## 9. Payload encoding — why HISTORY_PULL said `invalid numeric input`
+
+The live peer rejected *every* HISTORY_PULL with `{"error": "invalid numeric
+input"}`, no matter which `fields` were requested.  It was not the field list.
+
+`peerctl` is a Linux ELF and this sandbox is x86-64 Linux, so the decisive test
+was to run the real client against `tools/mockpeer.py` and dump its inbound
+frames to a file (`MOCK_TURN_URI` must be a scheme pion can parse — plain
+`turn:` — or ICE fails before any frame is sent).  Differencing the two
+HISTORY_PULL frames:
+
+```
+peerctl: a3 65 6166746572 f90000 65 6c696d6974 f94900 66 6669656c6473 83 ...
+client : a3 65 6c696d6974 0a     65 6166746572 00     66 6669656c6473 83 ...
+```
+
+Three differences, all of them coming from the same root cause — `peerctl`'s
+JSON-lines input turns numbers into `float64` and hands them to
+`fxamacker/cbor`:
+
+1. `limit`/`after` are **floats**, not ints (`f9 4900` = 10.0, not `0a`).
+   A Go server that decodes into `map[string]interface{}` and then type-asserts
+   `.(float64)` gets `uint64` from a CBOR uint and fails exactly this way.
+2. Go encodes the **narrowest float that round-trips**: 10.0 → `f9 4900`
+   (half), 100000.0 → `fa 47c35000` (single), 1700000007.0 → `fb ...` (double).
+   Python's `cbor2` always emits `fb`, which is legal CBOR but not byte-equal.
+3. map keys are emitted **sorted by encoded length, then bytewise**
+   (`after`, `limit`, `fields`), not in insertion order.
+
+`cbor_go()` in `tools/slopped_client.py` reproduces all three, and with it the
+client's HISTORY_PULL and CHAT frames are now **byte-identical** to `peerctl`'s
+(verified by programmatic diff of the mock's frame log, not by eye):
+
+```
+474d5031011000000000000100000000000000010000002f
+a3656166746572f90000656c696d6974f94900666669656c6473836673656e64657264626f64796773656e745f6174
+```
+
+Method note: never hand-copy hex out of a log tail.  The first attempt at this
+compared my transcription of peerctl's frame, which had dropped one byte, and
+"proved" a mismatch that did not exist.  Capture to a file and diff in code.
+
+`CHAT` was already byte-identical to `peerctl`, so the live peer's
+`{"error": "invalid chat message"}` is a *semantic* rejection (guest role, or a
+schema `peerctl` satisfies some other way), not an encoding one.  That is the
+remaining unknown; `dump` is the path that matters, since the flag is history.

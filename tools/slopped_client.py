@@ -119,6 +119,8 @@ def cbor_go(v):
     raise TypeError("cannot CBOR-encode %r" % (type(v),))
 
 
+FLAG_RE = re.compile(r"zdk\{[^{}]*\}|flag\{[^{}]*\}", re.I)
+
 PAYLOAD_ENCODER = cbor_go
 
 
@@ -450,17 +452,29 @@ async def cmd_dump(cli, args):
     so one HISTORY_PULL only ever returns 32 rows; walk the cursor instead."""
     cap = int(cli.cfg.get("max_history_batch") or 32)
     limit = max(1, min(args.limit, cap))
-    fields = json.loads(args.fields)
+    # --fields none omits the key entirely, which is how you learn the server's
+    # own default projection when you do not know the column names.
+    fields = None if args.fields.strip().lower() in ("none", "null", "-") \
+        else json.loads(args.fields)
     after = args.after
     total = 0
+    hits = []
+    seen = set()
+    raw_log = open(args.out + ".frames.hex", "w") if args.out else None
     for page in range(args.pages):
-        f = await cli.request(TYPE_HISTORY,
-                              {"limit": float(limit), "after": float(after),
-                               "fields": fields},
-                              timeout=args.timeout)
+        payload = {"limit": float(limit), "after": float(after)}
+        if fields is not None:
+            payload["fields"] = fields
+        f = await cli.request(TYPE_HISTORY, payload, timeout=args.timeout)
+        if raw_log is not None:
+            raw_log.write(json.dumps(f, default=str) + "\n")
         p = f.get("payload")
         if not isinstance(p, dict):
             print("page %d: unexpected payload %s" % (page, json.dumps(f, default=str)))
+            break
+        if p.get("error"):
+            # previously an error looked exactly like an empty archive
+            print("[!] page %d: server error: %s" % (page, p["error"]), file=sys.stderr)
             break
         rows = p.get("rows") or p.get("items") or p.get("history") or []
         if not isinstance(rows, list):
@@ -468,7 +482,11 @@ async def cmd_dump(cli, args):
             break
         for r in rows:
             total += 1
-            print(json.dumps(r, default=str))
+            line = json.dumps(r, default=str, sort_keys=True)
+            print(line)
+            if FLAG_RE.search(line):
+                hits.append(line)
+            seen.add(line)
         print("[*] page %d: %d rows (after=%s)" % (page, len(rows), after),
               file=sys.stderr)
         if not rows or len(rows) < limit:
@@ -484,7 +502,15 @@ async def cmd_dump(cli, args):
             print("[*] no cursor key in %r; stopping" % (last,), file=sys.stderr)
             break
         after = nxt
+    if raw_log is not None:
+        raw_log.close()
+        with open(args.out, "w") as fh:
+            fh.write("\n".join(sorted(seen)) + ("\n" if seen else ""))
+        print("[*] wrote %d unique rows to %s" % (len(seen), args.out),
+              file=sys.stderr)
     print("[*] dumped %d rows total" % total, file=sys.stderr)
+    for h in hits:
+        print("[FLAG] %s" % h)
 
 
 async def cmd_raw(cli, args):
@@ -692,7 +718,9 @@ def main():
     p.add_argument("--limit", type=int, default=32)
     p.add_argument("--after", type=int, default=0)
     p.add_argument("--pages", type=int, default=200)
-    p.add_argument("--fields", default='["sender","body","sent_at"]')
+    p.add_argument("--fields", default='["sender","body","sent_at"]',
+                   help='JSON array of column names, or "none" to omit')
+    p.add_argument("--out", default="", help="write every unique row to this file")
     sub.add_parser("recon")
     sub.add_parser("probe")
     args = ap.parse_args()
