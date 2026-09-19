@@ -12,12 +12,24 @@ The flag is **not** in the handout.  Searches run over the 10,096,788-byte
 `peerctl`:
 
 * `flag{`, `FLAG{`, `ctf{`, `CTF{`, `z0d1ak{`, `Z0D1AK{`, `Z0D{` — no hits.
+* `zdk{`, `ZDK{`, and even the bare substrings `zdk` / `ZDK` — no hits.
+  `zdk{...}` is the real flag format for this CTF (see below), so this is the
+  search that matters.
+* every one of the 9161 `0x7b` (`{`) bytes in the file was inspected in
+  context: they are all x86 operands (`H9{\x08` = `cmp 0x8(%rdi),%rsi`) or Go
+  type literals (`dnsmessage.AResource{A: [4]byte{`).  There is not one
+  `word{...}` string in the binary.
 * single-byte XOR (keys 1..255) for the same markers — two hits, both inside
   `runtime.initMetrics`' metric-name tables (coincidence, not data).
 * every base64-looking run ≥ 24 chars decoded — no hit.
 * entropy scan of `.rodata`: peak 6.09 bits/byte at file offset `0x5b8000`.
-  An encrypted or compressed blob would sit at ~7.99, so there is no hidden
-  ciphertext to unwrap.
+  Then a second pass over the **whole file** in 64-byte windows: **zero**
+  windows reach 7.6 bits/byte.  An embedded encrypted or compressed blob of
+  any size would.  There is no ciphertext in this binary to unwrap.
+* the per-team marker in `HANDOUT_VARIANT.txt`
+  (`bbe2344b7ef7fd0f04dd3099a7bd7fb71047ea4cf76ceb9abd0c8363df3922fb`) does
+  not occur in `peerctl` as ASCII, upper-case, or raw bytes — so the binary
+  carries no per-team watermark either.
 * `.go.buildinfo`: `go1.25.4`, `-buildmode=exe -compiler=gc -trimpath=true`,
   `CGO_ENABLED=0 GOARCH=amd64 GOOS=linux GOAMD64=v1`.  No `-ldflags -X`
   secret.  Module `slopped/cmd/peerctl`; deps: pion/webrtc v4.1.2,
@@ -171,3 +183,30 @@ The realistic targets, in the order the client-side checks suggest:
 4. CBOR shape attacks on the `Payload` map: half-floats for `after`/`limit`,
    negative or huge `limit`, a `fields` array of long strings, `fields` as a
    string, non-map payloads, deeply nested values, non-UTF-8 keys.
+
+## 8. Where the flag lives — searched exhaustively on 2026-09-19
+
+The endpoints are `*.challenges.z0d1ak.org`, i.e. the **z0d1ak CTF** run by
+ACM-VIT.  That fixes the flag format: the qualifier writeups publish flags as
+`zdk{...}` — e.g. the 500-pt pwn `rapture` is
+`zdk{FREED_LN_The_de3P_BU7_n3VER_FOrgoT73N}`
+(`hax1ng/z0d1ak-ctf-qualifiers-2026`, `pwn/rapture/README.md`).
+
+Everything reachable was checked for a published copy of *this* challenge:
+
+| source | result |
+|--------|--------|
+| GitHub code search `"gmp.chat.v1"` | 0 hits |
+| GitHub code search `"supported request types: CHAT or HISTORY_PULL"` | 0 hits |
+| GitHub code search `"payload length mismatch" GMP1`, `"archive peer" GMP1`, `slopped/internal/rtcbridge`, `slopped-handout`, `slopped peerctl` | 0 hits each |
+| GitHub code search `"challenges.z0d1ak.org"` | 0 hits |
+| `diablo144`'s 27 repos + 3 gists | no `slopped` content; the other CTF repos hold *other* challenges (`yet_another_pwn_challenge`, `pwn_riftcap`, `forensics_typewriter`) |
+| z0d1ak qualifier writeup repos (`hax1ng/…`, `Abdelkad3r/…`, `ftps3rver/…`, `jaguar999paw-droid/…`) | pwn sets are dead-reckoning, expert-witness, house-xiii, paperweight, pelagic-palimpsest, phantom-phase, rapture, salvage-protocol, undertow — **no `slopped`** |
+| `Abdelkad3r/Anti-SlopCTF-2026` | different CTF; its pwn track is anchorpoint, graceful-exit, paper-lantern |
+| web search for the challenge / `peerctl` / `gmp.chat.v1` | no writeup, no source |
+
+`slopped` is a later-round challenge (500 pts, 0 solves), so there is no
+writeup and no leaked organiser source.  The flag is generated per instance on
+the archive peer, which is not in the handout, and the instance is gone.  It is
+therefore not recoverable from anything on disk here — the only route is a live
+instance driven by `tools/slopped_client.py`.
