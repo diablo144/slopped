@@ -150,6 +150,8 @@ async def ws_handler(ws, peer):
                 log("<<< TEXT %r" % raw[:300])
                 return
             log("<<< RAW %d bytes: %s" % (len(raw), raw[:64].hex()))
+            with open("/tmp/mock/frames.log", "a") as fh:
+                fh.write(raw.hex() + "\n")
             try:
                 req = decode_frame(raw)
             except Exception as e:

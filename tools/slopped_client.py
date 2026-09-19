@@ -61,11 +61,72 @@ ROLE_QUERY = "?role=guest"
 # --------------------------------------------------------------------------
 # frame codec
 # --------------------------------------------------------------------------
+def _enc_head(major, n):
+    if n < 24:
+        return bytes([(major << 5) | n])
+    if n < 0x100:
+        return bytes([(major << 5) | 24, n])
+    if n < 0x10000:
+        return bytes([(major << 5) | 25]) + struct.pack("!H", n)
+    if n < 0x100000000:
+        return bytes([(major << 5) | 26]) + struct.pack("!I", n)
+    return bytes([(major << 5) | 27]) + struct.pack("!Q", n)
+
+
+def _enc_float(x):
+    """Go's fxamacker/cbor writes the narrowest float that round-trips, so
+    10.0 goes out as f9 4900 (half) and not fb 4024... (double).  The server
+    type-asserts float64 and answers `invalid numeric input` to a CBOR uint,
+    so HISTORY_PULL's limit/after have to be encoded exactly like this."""
+    import struct as _st
+    try:
+        h = _st.pack("!e", x)
+    except OverflowError:
+        h = None
+    if h is not None and (_st.unpack("!e", h)[0] == x or x != x):
+        return b"\xf9" + h
+    f = _st.pack("!f", x)
+    if _st.unpack("!f", f)[0] == x:
+        return b"\xfa" + f
+    return b"\xfb" + _st.pack("!d", x)
+
+
+def cbor_go(v):
+    """Minimal CBOR encoder matching peerctl's byte output."""
+    if v is None:
+        return b"\xf6"
+    if v is True:
+        return b"\xf5"
+    if v is False:
+        return b"\xf4"
+    if isinstance(v, float):
+        return _enc_float(v)
+    if isinstance(v, int):
+        return _enc_head(0, v) if v >= 0 else _enc_head(1, -1 - v)
+    if isinstance(v, str):
+        b = v.encode("utf-8")
+        return _enc_head(3, len(b)) + b
+    if isinstance(v, (bytes, bytearray)):
+        return _enc_head(2, len(v)) + bytes(v)
+    if isinstance(v, (list, tuple)):
+        return _enc_head(4, len(v)) + b"".join(cbor_go(x) for x in v)
+    if isinstance(v, dict):
+        # Go's fxamacker/cbor sorts map keys by encoded length first, then
+        # lexicographically, which is why peerctl emits after, limit, fields.
+        enc = [(cbor_go(k), cbor_go(val)) for k, val in v.items()]
+        enc.sort(key=lambda kv: (len(kv[0]), kv[0]))
+        return _enc_head(5, len(enc)) + b"".join(k + val for k, val in enc)
+    raise TypeError("cannot CBOR-encode %r" % (type(v),))
+
+
+PAYLOAD_ENCODER = cbor_go
+
+
 def build_frame(ftype=TYPE_CHAT, flags=0, stream=1, seq=1, payload=None,
                 cbor_bytes=None, declared_len=None):
     """Build a frame.  declared_len / cbor_bytes let you lie to the peer."""
     if cbor_bytes is None:
-        cbor_bytes = cbor2.dumps(payload) if payload is not None else b""
+        cbor_bytes = PAYLOAD_ENCODER(payload) if payload is not None else b""
     n = len(cbor_bytes) if declared_len is None else declared_len
     return (MAGIC + bytes([VERSION, ftype & 0xFF])
             + struct.pack(">HIQI", flags & 0xFFFF, stream & 0xFFFFFFFF,
@@ -256,11 +317,11 @@ class Client:
         peer tears the session down as soon as the signalling socket closes."""
         ws_url = self.cfg["websocket"]
         ws_url += ("&" if "?" in ws_url else "?") + ROLE_QUERY.lstrip("?")
-        # websockets rejects ssl=None for a wss:// URI, so hand it a verifying
-        # context unless --insecure already supplied an unverified one.
-        ws_ssl = self.ssl_ctx
-        if ws_ssl is None and ws_url.lower().startswith("wss://"):
-            ws_ssl = ssl.create_default_context()
+        # The context must match the scheme: websockets rejects ssl=None on a
+        # wss:// URI *and* any context on a ws:// URI.
+        ws_ssl = None
+        if ws_url.lower().startswith("wss://"):
+            ws_ssl = self.ssl_ctx or ssl.create_default_context()
         self.ws = await ws_connect(ws_url, ssl=ws_ssl, open_timeout=timeout)
 
         await self.pc.setLocalDescription(await self.pc.createOffer())
@@ -378,7 +439,7 @@ async def cmd_chat(cli, args):
 
 
 async def cmd_history(cli, args):
-    payload = {"limit": args.limit, "after": args.after,
+    payload = {"limit": float(args.limit), "after": float(args.after),
                "fields": json.loads(args.fields)}
     f = await cli.request(TYPE_HISTORY, payload, timeout=args.timeout)
     print(json.dumps(f, default=str))
@@ -394,7 +455,8 @@ async def cmd_dump(cli, args):
     total = 0
     for page in range(args.pages):
         f = await cli.request(TYPE_HISTORY,
-                              {"limit": limit, "after": after, "fields": fields},
+                              {"limit": float(limit), "after": float(after),
+                               "fields": fields},
                               timeout=args.timeout)
         p = f.get("payload")
         if not isinstance(p, dict):
@@ -466,7 +528,8 @@ async def cmd_recon(cli, args):
         for limit, after in ((10, 0), (100000, -1), (1000, 0)):
             try:
                 f = await cli.request(TYPE_HISTORY,
-                                      {"limit": limit, "after": after, "fields": fields},
+                                      {"limit": float(limit), "after": float(after),
+                                       "fields": fields},
                                       timeout=args.timeout)
                 print("  fields=%-70s limit=%-6s after=%-3s -> %s"
                       % (fields, limit, after, json.dumps(f.get("payload"), default=str)[:600]))
@@ -475,12 +538,13 @@ async def cmd_recon(cli, args):
                       % (fields, limit, after))
 
     print("== extra payload keys ==")
-    for payload in ({"limit": 10, "after": 0, "fields": ["sender"], "all": True},
-                    {"limit": 10, "after": 0, "fields": ["sender"], "include_deleted": True},
-                    {"limit": 10, "after": 0, "fields": ["sender"], "room": "admin"},
-                    {"limit": 10, "after": 0, "fields": ["sender"], "type": "ADMIN"},
-                    {"limit": 10, "after": 0, "fields": ["sender"], "role": "admin"},
-                    {"limit": 10, "after": 0, "fields": ["sender"], "sql": "1=1"}):
+    for payload in ({"limit": 10.0, "after": 0.0, "fields": ["sender"], "all": True},
+                    {"limit": 10.0, "after": 0.0, "fields": ["sender"],
+                     "include_deleted": True},
+                    {"limit": 10.0, "after": 0.0, "fields": ["sender"], "room": "admin"},
+                    {"limit": 10.0, "after": 0.0, "fields": ["sender"], "type": "ADMIN"},
+                    {"limit": 10.0, "after": 0.0, "fields": ["sender"], "role": "admin"},
+                    {"limit": 10.0, "after": 0.0, "fields": ["sender"], "sql": "1=1"}):
         try:
             f = await cli.request(TYPE_HISTORY, payload, timeout=args.timeout)
             print("  %-72s -> %s" % (json.dumps(payload), json.dumps(f.get("payload"), default=str)[:400]))
