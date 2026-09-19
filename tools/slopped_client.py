@@ -269,42 +269,160 @@ async def cmd_raw(cli, args):
     print(json.dumps(f, default=str) if f else "null")
 
 
+async def cmd_recon(cli, args):
+    """Cheap first pass: read everything the peer will say before breaking it.
+
+    The description says the archive peer keeps the history off the server, so
+    the cheapest win is a history entry that the default field list hides.
+    """
+    print("== chat probes ==")
+    for text in ["help", "/help", "?", "flag", "list", "", "A" * 4]:
+        try:
+            f = await cli.request(TYPE_CHAT, {"text": text}, timeout=args.timeout)
+            print("  chat %-8r -> %s" % (text, json.dumps(f.get("payload"), default=str)))
+        except asyncio.TimeoutError:
+            print("  chat %-8r -> (no reply)" % text)
+
+    print("== history field guesses ==")
+    guesses = [
+        ["sender", "body", "sent_at"],
+        ["sender", "body", "sent_at", "flag"],
+        ["flag"], ["secret"], ["body"], ["*"], ["sender", "body", "id", "room",
+                                                "topic", "channel", "raw", "text",
+                                                "key", "note", "admin"],
+    ]
+    for fields in guesses:
+        for limit, after in ((10, 0), (100000, -1), (1000, 0)):
+            try:
+                f = await cli.request(TYPE_HISTORY,
+                                      {"limit": limit, "after": after, "fields": fields},
+                                      timeout=args.timeout)
+                print("  fields=%-70s limit=%-6s after=%-3s -> %s"
+                      % (fields, limit, after, json.dumps(f.get("payload"), default=str)[:600]))
+            except asyncio.TimeoutError:
+                print("  fields=%-70s limit=%-6s after=%-3s -> (no reply)"
+                      % (fields, limit, after))
+
+    print("== extra payload keys ==")
+    for payload in ({"limit": 10, "after": 0, "fields": ["sender"], "all": True},
+                    {"limit": 10, "after": 0, "fields": ["sender"], "include_deleted": True},
+                    {"limit": 10, "after": 0, "fields": ["sender"], "room": "admin"},
+                    {"limit": 10, "after": 0, "fields": ["sender"], "type": "ADMIN"},
+                    {"limit": 10, "after": 0, "fields": ["sender"], "role": "admin"},
+                    {"limit": 10, "after": 0, "fields": ["sender"], "sql": "1=1"}):
+        try:
+            f = await cli.request(TYPE_HISTORY, payload, timeout=args.timeout)
+            print("  %-72s -> %s" % (json.dumps(payload), json.dumps(f.get("payload"), default=str)[:400]))
+        except asyncio.TimeoutError:
+            print("  %-72s -> (no reply)" % json.dumps(payload))
+
+
 async def cmd_probe(cli, args):
-    """Fire the obvious malformed-frame probes at the peer and print replies."""
+    """Fire malformed-frame probes at the peer; report ALIVE/DEAD after each.
+
+    A probe that returns nothing is ambiguous -- the peer may have rejected the
+    frame or it may have died.  Every probe is followed by a benign CHAT ping:
+    if the ping also fails, the peer is gone, which is the crash oracle.
+    """
+    big = "A" * 4000
     probes = [
-        ("type=0x00 (unused)", build_frame(0x00, 0, 1, 1, {"text": "x"})),
-        ("type=0xff", build_frame(0xFF, 0, 1, 2, {"text": "x"})),
-        ("flags=0xffff", build_frame(TYPE_CHAT, 0xFFFF, 1, 3, {"text": "x"})),
-        ("stream=0", build_frame(TYPE_CHAT, 0, 0, 4, {"text": "x"})),
-        ("stream=0xffffffff", build_frame(TYPE_CHAT, 0, 0xFFFFFFFF, 5, {"text": "x"})),
-        ("declared len < actual", build_frame(TYPE_CHAT, 0, 1, 6, {"text": "x"}, declared_len=1)),
-        ("declared len > actual", build_frame(TYPE_CHAT, 0, 1, 7, {"text": "x"}, declared_len=4096)),
-        ("bad magic", b"XXXX" + build_frame(TYPE_CHAT, 0, 1, 8, {"text": "x"})[4:]),
-        ("version 2", MAGIC + b"\x02" + build_frame(TYPE_CHAT, 0, 1, 9, {"text": "x"})[5:]),
-        ("truncated header", build_frame(TYPE_CHAT, 0, 1, 10, {"text": "x"})[:12]),
+        ("baseline chat", build_frame(TYPE_CHAT, 0, 1, 1, {"text": "x"})),
+        ("type=0x00", build_frame(0x00, 0, 1, 2, {"text": "x"})),
+        ("type=0x11", build_frame(0x11, 0, 1, 3, {"text": "x"})),
+        ("type=0x21", build_frame(0x21, 0, 1, 4, {"text": "x"})),
+        ("type=0x30", build_frame(0x30, 0, 1, 5, {"text": "x"})),
+        ("type=0x40", build_frame(0x40, 0, 1, 6, {"text": "x"})),
+        ("type=0xff", build_frame(0xFF, 0, 1, 7, {"text": "x"})),
+        ("flags=0x0001", build_frame(TYPE_CHAT, 0x0001, 1, 8, {"text": "x"})),
+        ("flags=0xffff", build_frame(TYPE_CHAT, 0xFFFF, 1, 9, {"text": "x"})),
+        ("stream=0", build_frame(TYPE_CHAT, 0, 0, 10, {"text": "x"})),
+        ("stream=0xffffffff", build_frame(TYPE_CHAT, 0, 0xFFFFFFFF, 11, {"text": "x"})),
+        ("seq=0", build_frame(TYPE_CHAT, 0, 1, 0, {"text": "x"})),
+        ("seq=0xffffffffffffffff", build_frame(TYPE_CHAT, 0, 1, (1 << 64) - 1, {"text": "x"})),
+        ("declared len < actual", build_frame(TYPE_CHAT, 0, 1, 12, {"text": "x"}, declared_len=1)),
+        ("declared len > actual", build_frame(TYPE_CHAT, 0, 1, 13, {"text": "x"}, declared_len=4096)),
+        ("declared len = 0", build_frame(TYPE_CHAT, 0, 1, 14, {"text": "x"}, declared_len=0)),
+        ("declared len = -1", build_frame(TYPE_CHAT, 0, 1, 15, {"text": "x"}, declared_len=0xFFFFFFFF)),
+        ("bad magic", b"XXXX" + build_frame(TYPE_CHAT, 0, 1, 16, {"text": "x"})[4:]),
+        ("version 0", MAGIC + b"\x00" + build_frame(TYPE_CHAT, 0, 1, 17, {"text": "x"})[5:]),
+        ("version 2", MAGIC + b"\x02" + build_frame(TYPE_CHAT, 0, 1, 18, {"text": "x"})[5:]),
+        ("truncated header (12B)", build_frame(TYPE_CHAT, 0, 1, 19, {"text": "x"})[:12]),
+        ("header only (24B)", build_frame(TYPE_CHAT, 0, 1, 20, None)),
         ("empty frame", b""),
-        ("oversize 32768", build_frame(TYPE_CHAT, 0, 1, 11, {"text": "A" * 40000})),
-        ("history limit huge", build_frame(TYPE_HISTORY, 0, 1, 12,
+        ("frame 32769 (one over cap)", build_frame(TYPE_CHAT, 0, 1, 21, {"text": "A" * 32700})),
+        ("frame 65000", build_frame(TYPE_CHAT, 0, 1, 22, {"text": "A" * 64000})),
+        ("chat fmt string", build_frame(TYPE_CHAT, 0, 1, 23, {"text": "%s.%s.%s.%s.%s.%s.%s.%s"})),
+        ("chat %n", build_frame(TYPE_CHAT, 0, 1, 24, {"text": "%n%n%n%n"})),
+        ("chat huge text", build_frame(TYPE_CHAT, 0, 1, 25, {"text": big})),
+        ("chat empty payload", build_frame(TYPE_CHAT, 0, 1, 26, {})),
+        ("chat no payload", build_frame(TYPE_CHAT, 0, 1, 27, None)),
+        ("chat non-map cbor", build_frame(TYPE_CHAT, 0, 1, 28, None, cbor_bytes=b"\x82\x01\x02")),
+        ("chat cbor array of strs", build_frame(TYPE_CHAT, 0, 1, 29, None,
+                                                cbor_bytes=cbor2.dumps(["a", "b"] * 500))),
+        ("history limit huge", build_frame(TYPE_HISTORY, 0, 1, 30,
                                            {"limit": 2 ** 31 - 1, "after": 0,
                                             "fields": ["sender", "body"]})),
-        ("history limit negative", build_frame(TYPE_HISTORY, 0, 1, 13,
-                                               {"limit": -1, "after": -1,
-                                                "fields": ["sender", "body"]})),
-        ("history many fields", build_frame(TYPE_HISTORY, 0, 1, 14,
-                                            {"limit": 10, "after": 0,
-                                             "fields": ["A" * 256] * 64})),
-        ("history fields not list", build_frame(TYPE_HISTORY, 0, 1, 15,
-                                                {"limit": 10, "after": 0,
-                                                 "fields": "sender"})),
-        ("chat empty payload", build_frame(TYPE_CHAT, 0, 1, 16, {})),
-        ("chat no payload", build_frame(TYPE_CHAT, 0, 1, 17, None)),
-        ("chat non-map cbor", build_frame(TYPE_CHAT, 0, 1, 18, None, cbor_bytes=b"\x82\x01\x02")),
-        ("chat huge text", build_frame(TYPE_CHAT, 0, 1, 19, {"text": "B" * 32000})),
+        ("history limit -1", build_frame(TYPE_HISTORY, 0, 1, 31,
+                                         {"limit": -1, "after": -1,
+                                          "fields": ["sender", "body"]})),
+        ("history limit 2^63", build_frame(TYPE_HISTORY, 0, 1, 32,
+                                           {"limit": 2 ** 63, "after": 0,
+                                            "fields": ["sender"]})),
+        ("history fmt fields", build_frame(TYPE_HISTORY, 0, 1, 33,
+                                           {"limit": 5, "after": 0,
+                                            "fields": ["%s", "%s%s%s%s", "%n"]})),
+        ("history long field", build_frame(TYPE_HISTORY, 0, 1, 34,
+                                           {"limit": 5, "after": 0,
+                                            "fields": ["A" * 4096]})),
+        ("history many fields", build_frame(TYPE_HISTORY, 0, 1, 35,
+                                            {"limit": 5, "after": 0,
+                                             "fields": ["f%d" % i for i in range(2000)]})),
+        ("history fields=str", build_frame(TYPE_HISTORY, 0, 1, 36,
+                                           {"limit": 5, "after": 0, "fields": "sender"})),
+        ("history fields=int", build_frame(TYPE_HISTORY, 0, 1, 37,
+                                           {"limit": 5, "after": 0, "fields": 7})),
+        ("history no fields", build_frame(TYPE_HISTORY, 0, 1, 38,
+                                          {"limit": 5, "after": 0})),
+        ("history no payload", build_frame(TYPE_HISTORY, 0, 1, 39, None)),
+        ("history after=str", build_frame(TYPE_HISTORY, 0, 1, 40,
+                                          {"limit": 5, "after": "0", "fields": ["sender"]})),
+        ("history after=float", build_frame(TYPE_HISTORY, 0, 1, 41,
+                                            {"limit": 5, "after": 1.5, "fields": ["sender"]})),
+        ("history deep nest", build_frame(TYPE_HISTORY, 0, 1, 42,
+                                          {"limit": 5, "after": 0,
+                                           "fields": _nest(60)})),
+        ("history non-utf8 key", build_frame(TYPE_HISTORY, 0, 1, 43, None,
+                                             cbor_bytes=b"\xa2\x65limit\x05\x66fields\x81\x64\xff\xfe")),
     ]
+    dead = 0
     for name, data in probes:
         cli.seq = 0
         r = await cli.send_raw(data, timeout=args.timeout, wait=True)
-        print("%-28s -> %s" % (name, json.dumps(r, default=str) if r else "no reply"))
+        alive = await _health(cli, args.timeout)
+        if not alive:
+            dead += 1
+        print("%-30s -> %-28s peer=%s"
+              % (name, json.dumps(r, default=str)[:160] if r else "no reply",
+                 "ALIVE" if alive else "DEAD  <-- crash/oracle"))
+        if not alive:
+            print("    peer stopped answering; reconnect and re-run from here")
+            break
+    print("probes sent: %d, peer deaths: %d" % (len(probes) if not dead else probes.index((name, data)) + 1, dead))
+
+
+def _nest(depth):
+    x = "leaf"
+    for _ in range(depth):
+        x = [x]
+    return x
+
+
+async def _health(cli, timeout):
+    try:
+        await cli.request(TYPE_CHAT, {"text": "ping"}, timeout=timeout)
+        return True
+    except Exception:                                       # noqa: BLE001
+        return False
 
 
 def main():
@@ -333,7 +451,8 @@ def main():
     p.add_argument("--pad-to", type=int, default=None,
                    help="pad the frame to N bytes (oversize probe)")
     p.add_argument("--no-wait", action="store_true")
-    p = sub.add_parser("probe")
+    sub.add_parser("recon")
+    sub.add_parser("probe")
     args = ap.parse_args()
 
     cfg = fetch_config(args.config, insecure=args.insecure)
@@ -345,8 +464,8 @@ def main():
         try:
             await cli.connect(timeout=args.timeout)
             print("[*] datachannel open", file=sys.stderr)
-            await {"chat": cmd_chat, "history": cmd_history,
-                   "raw": cmd_raw, "probe": cmd_probe}[args.cmd](cli, args)
+            await {"chat": cmd_chat, "history": cmd_history, "raw": cmd_raw,
+                   "recon": cmd_recon, "probe": cmd_probe}[args.cmd](cli, args)
         finally:
             await cli.close()
 
